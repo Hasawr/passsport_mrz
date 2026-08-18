@@ -1,0 +1,358 @@
+"""Record third-party API calls and persist request/response payloads locally."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from email.parser import BytesParser
+from email.policy import default
+from typing import Any, Callable
+
+from starlette.datastructures import UploadFile
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.types import Message
+
+from shared.audit import AuditStore, get_audit_store, sanitize_filename, service_from_path
+from shared.config import get_settings
+
+
+logger = logging.getLogger(__name__)
+
+SKIP_PREFIXES = (
+    "/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/favicon.ico",
+)
+
+
+REQUEST_PARTS_STATE_KEY = "audit_request_parts"
+
+
+def record_request_parts(
+    request: Request,
+    field: str,
+    uploads: list[UploadFile],
+) -> None:
+    parts: list[dict[str, Any]] = []
+    for upload in uploads:
+        size = getattr(upload, "size", None)
+        if size is None:
+            try:
+                size = upload.file.seek(0, os.SEEK_END)
+                upload.file.seek(0)
+            except (AttributeError, OSError, ValueError):
+                size = None
+        parts.append(
+            {
+                "field": field,
+                "file_name": upload.filename,
+                "content_type": upload.content_type,
+                "size_bytes": int(size) if size is not None else None,
+            }
+        )
+    setattr(request.state, REQUEST_PARTS_STATE_KEY, parts)
+
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Response],
+    ) -> Response:
+        path = request.url.path
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in SKIP_PREFIXES):
+            return await call_next(request)
+
+        settings = getattr(request.app.state, "settings", None)
+        if settings is None:
+            settings = get_settings()
+        request_body = b""
+        if settings.audit_store_payloads:
+            request_body = await request.body()
+            request = Request(
+                request.scope,
+                self._replay_receive(request_body),
+            )
+
+        started_at = time.perf_counter()
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - started_at) * 1000.0
+
+        response_body = b""
+        async for chunk in response.body_iterator:
+            response_body += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+
+        content_type = response.headers.get("content-type", "")
+        parsed_response = self._parse_json(response_body, content_type)
+        error_code = self._extract_error_code(parsed_response)
+        sanitized_response = self._sanitize_response(
+            parsed_response,
+            response.status_code,
+        )
+
+        store = getattr(request.app.state, "audit_store", None) or get_audit_store()
+
+        try:
+            request_accepted = response.status_code < 400
+            request_parts = (
+                self._read_request_parts(
+                    request.headers.get("content-type"),
+                    request_body,
+                )
+                if request_accepted
+                else []
+            )
+            request_files: list[dict[str, Any]] = [
+                description for description, _payload in request_parts
+            ]
+            if request_accepted and not request_files:
+                request_files = list(
+                    getattr(request.state, REQUEST_PARTS_STATE_KEY, None) or []
+                )
+            payload_dir = None
+            if (
+                settings.audit_store_payloads
+                and request_accepted
+                and request_body
+                and store.can_store_payload(
+                    len(request_body),
+                    settings.audit_max_payload_bytes,
+                )
+            ):
+                request_files, payload_dir = self._persist_request_payload(
+                    store=store,
+                    parts=request_parts,
+                )
+            store.record(
+                method=request.method,
+                path=path,
+                service=service_from_path(path),
+                status_code=response.status_code,
+                latency_ms=latency_ms,
+                api_key=request.headers.get("x-api-key"),
+                error_code=error_code,
+                client_host=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                request_content_type=request.headers.get("content-type"),
+                request_query=request.url.query or None,
+                request_files=request_files,
+                response_body=sanitized_response,
+                payload_dir=payload_dir,
+            )
+            store.maybe_prune(
+                retention_days=settings.audit_retention_days,
+                max_payload_bytes=settings.audit_max_payload_bytes,
+            )
+        except Exception:
+            logger.exception("Failed to write API audit event for %s %s", request.method, path)
+
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+        return Response(
+            content=response_body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+            background=response.background,
+        )
+
+    @staticmethod
+    def _replay_receive(body: bytes):
+        sent = False
+
+        async def receive() -> Message:
+            nonlocal sent
+            if sent:
+                return {"type": "http.disconnect"}
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return receive
+
+    def _read_request_parts(
+        self,
+        content_type: str | None,
+        body: bytes,
+    ) -> list[tuple[dict[str, Any], bytes]]:
+        if not body:
+            return []
+
+        if content_type and "multipart/form-data" in content_type:
+            message = BytesParser(policy=default).parsebytes(
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8") + body
+            )
+            parts: list[tuple[dict[str, Any], bytes]] = []
+            for index, part in enumerate(message.iter_parts()):
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                field_name = (
+                    part.get_param("name", header="content-disposition")
+                    or f"part_{index}"
+                )
+                file_name = part.get_filename()
+                description: dict[str, Any] = {
+                    "field": field_name,
+                    "file_name": file_name,
+                    "content_type": part.get_content_type(),
+                    "size_bytes": len(payload),
+                }
+                if not file_name:
+                    description["value_preview"] = payload.decode(
+                        "utf-8", errors="replace"
+                    )[:500]
+                parts.append((description, payload))
+            return parts
+
+        extension = ".json" if content_type and "json" in content_type else ".bin"
+        return [
+            (
+                {
+                    "field": "body",
+                    "file_name": f"request_body{extension}",
+                    "content_type": content_type,
+                    "size_bytes": len(body),
+                },
+                body,
+            )
+        ]
+
+    def _persist_request_payload(
+        self,
+        *,
+        store: AuditStore,
+        parts: list[tuple[dict[str, Any], bytes]],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if not parts:
+            return [], None
+
+        data_root = store.payload_dir.parent
+        directory = store.allocate_payload_dir()
+        files: list[dict[str, Any]] = []
+
+        for index, (description, payload) in enumerate(parts):
+            fallback = f"part_{index}.bin"
+            safe_name = sanitize_filename(
+                description.get("file_name") or f"{description['field']}.txt",
+                fallback=fallback,
+            )
+            destination = directory / f"{index:02d}_{safe_name}"
+            destination.write_bytes(payload)
+            files.append(
+                {
+                    **description,
+                    "saved_path": str(
+                        destination.relative_to(data_root)
+                    ).replace("\\", "/"),
+                }
+            )
+
+        if not files:
+            directory.rmdir()
+            return [], None
+
+        return files, str(directory.relative_to(data_root)).replace("\\", "/")
+
+    @staticmethod
+    def _parse_json(body: bytes, content_type: str) -> Any | None:
+        if not body or "application/json" not in content_type:
+            return None
+        try:
+            return json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _extract_error_code(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            return str(code) if code is not None else None
+
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            return detail[:120]
+        return None
+
+    @classmethod
+    def _sanitize_response(
+        cls,
+        payload: Any,
+        status_code: int,
+    ) -> Any:
+        if not isinstance(payload, dict):
+            return {"status_code": status_code}
+
+        sanitized: dict[str, Any] = {
+            "service": payload.get("service"),
+            "version": payload.get("version"),
+        }
+        error = payload.get("error")
+        if isinstance(error, dict):
+            sanitized["error"] = {"code": error.get("code")}
+            return sanitized
+        if status_code >= 400:
+            sanitized["detail"] = "Request rejected."
+            return sanitized
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return sanitized
+        if "mrz_line1" in data:
+            sanitized["data"] = cls._sanitize_passport_detection(data)
+            return sanitized
+
+        results = data.get("results")
+        if isinstance(results, list):
+            sanitized_results = [
+                {
+                    "index": item.get("index"),
+                    **cls._sanitize_passport_detection(item),
+                }
+                for item in results
+                if isinstance(item, dict)
+            ]
+            sanitized["data"] = {
+                "count": len(sanitized_results),
+                "results": sanitized_results,
+            }
+        return sanitized
+
+    @staticmethod
+    def _sanitize_passport_detection(item: dict[str, Any]) -> dict[str, Any]:
+        """Redact sensitive passport MRZ fields from audit records."""
+        details = item.get("mrz_details")
+        safe_details = None
+        if isinstance(details, dict):
+            safe_details = {
+                "method": details.get("method"),
+                "checksum_valid": details.get("checksum_valid"),
+                "composite_checksum_valid": details.get("composite_checksum_valid"),
+                "nationality": details.get("nationality"),
+                "passport_number": (
+                    "[REDACTED]" if details.get("passport_number") else None
+                ),
+                "surname": "[REDACTED]" if details.get("surname") else None,
+                "given_names": "[REDACTED]" if details.get("given_names") else None,
+                "date_of_birth": (
+                    "[REDACTED]" if details.get("date_of_birth") else None
+                ),
+                "personal_number": (
+                    "[REDACTED]" if details.get("personal_number") else None
+                ),
+            }
+        return {
+            "mrz_line1": "[REDACTED]" if item.get("mrz_line1") else None,
+            "mrz_line2": "[REDACTED]" if item.get("mrz_line2") else None,
+            "confidence": item.get("confidence"),
+            "mrz_details": safe_details,
+        }

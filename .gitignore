@@ -1,0 +1,48 @@
+# Environments & Virtualenv
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables & Secrets
+.env
+*.env
+
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local SQLite databases and audits
+*.db
+*.sqlite3
+audit.db
+audit_payloads/
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+*.tiff
+*.tif
+*.svg
+*.ico
+
+# Debug output & artifacts
+comparison_output.txt
